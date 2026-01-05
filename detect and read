@@ -1,0 +1,198 @@
+import cv2
+import argparse
+from ultralytics import YOLO
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from PIL import Image
+import numpy as np
+import torch
+import re
+import time
+
+# =======================
+# CONFIGURATION
+# =======================
+MODEL_PATH = r"C:\Users\mukan\OneDrive\Documentos\digiscan\runs\detect\train\weights\best.pt"
+
+# Frame skipping (process 1 every N frames)
+FRAME_SKIP = 10
+
+# Regex pattern for Zambian plates: 3 letters + 4 digits + ZM
+PLATE_PATTERN = re.compile(r"^[A-Z]{3}[0-9]{4}ZM$")
+
+# =======================
+# Load models once
+# =======================
+model = YOLO(MODEL_PATH)
+
+processor = TrOCRProcessor.from_pretrained("microsoft/trocr-small-printed")
+trocr_model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
+trocr_model.eval()  # eval mode to save memory
+
+# =======================
+# Cache for OCR results to avoid re-reading the same plate repeatedly
+# Key: bbox tuple (x1, y1, x2, y2), Value: (plate_text, timestamp)
+ocr_cache = {}
+CACHE_EXPIRY_SECONDS = 5  # Re-run OCR on plate if not seen for 5 seconds
+
+# =======================
+# Post-processing & normalization
+# =======================
+def normalize_plate(raw):
+    raw = raw.replace(" ", "").upper()
+
+    # Common OCR confusion corrections
+    letter_fixes = {"0": "O", "1": "I", "5": "S", "8": "B"}
+    digit_fixes = {"O": "0", "I": "1", "S": "5", "B": "8"}
+
+    chars = list(raw)
+
+    for i in range(len(chars)):
+        if i < 3:  # letters
+            chars[i] = letter_fixes.get(chars[i], chars[i])
+        elif 3 <= i < 7:  # digits
+            chars[i] = digit_fixes.get(chars[i], chars[i])
+
+    fixed = "".join(chars)
+
+    if PLATE_PATTERN.match(fixed):
+        return fixed
+
+    return raw  # fallback to raw if pattern doesn't match
+
+# =======================
+# OCR function
+# =======================
+def trocr_read(crop):
+    # Convert BGR to PIL RGB
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+
+    # Prepare input
+    pixel_values = processor(images=pil_img, return_tensors="pt").pixel_values
+
+    with torch.no_grad():
+        generated_ids = trocr_model.generate(pixel_values, max_length=16)
+
+    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return text.strip()
+
+# =======================
+# Check cache or run OCR
+# =======================
+def read_plate_with_cache(bbox, crop):
+    now = time.time()
+    key = tuple(map(int, bbox))
+
+    if key in ocr_cache:
+        plate_text, timestamp = ocr_cache[key]
+        if now - timestamp < CACHE_EXPIRY_SECONDS:
+            return plate_text
+
+    # Not cached or expired: run OCR
+    plate_text = trocr_read(crop)
+    plate_text = plate_text if plate_text else "UNKNOWN"
+    plate_text = normalize_plate(plate_text)
+
+    ocr_cache[key] = (plate_text, now)
+    return plate_text
+
+# =======================
+# Process single image
+# =======================
+def process_image(path):
+    img = cv2.imread(path)
+    if img is None:
+        print(f"[ERROR] Image not found: {path}")
+        return
+
+    results = model(img)[0]
+
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        plate_text = read_plate_with_cache((x1, y1, x2, y2), crop)
+        conf = float(box.conf[0])
+
+        print(f"[+] Plate: {plate_text} (Conf: {conf:.2f})")
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(img, plate_text, (x1, max(y1 - 10, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+    cv2.imshow("DigiScan + TrOCR", img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# =======================
+# Process video with frame skipping + cache
+# =======================
+def process_video(source):
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open video source: {source}")
+        return
+
+    frame_id = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_id += 1
+        if frame_id % FRAME_SKIP != 0:
+            # Skip frames to reduce OCR load
+            cv2.imshow("DigiScan Live (TrOCR)", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
+
+        results = model(frame)[0]
+
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            plate_text = read_plate_with_cache((x1, y1, x2, y2), crop)
+            conf = float(box.conf[0])
+
+            print(f"[LIVE] Plate: {plate_text} (Conf: {conf:.2f})")
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, plate_text, (x1, max(y1 - 10, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+        cv2.imshow("DigiScan Live (TrOCR)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# =======================
+# MAIN
+# =======================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="YOLO + TrOCR OCR")
+    parser.add_argument("--image", type=str, help="Path to input image")
+    parser.add_argument("--video", type=str, help="Path to video file or webcam index")
+
+    args = parser.parse_args()
+
+    if args.image:
+        process_image(args.image)
+    elif args.video:
+        try:
+            source = int(args.video)
+        except ValueError:
+            source = args.video
+        process_video(source)
+    else:
+        print("Usage:")
+        print("  python digiscan_trocr.py --image image.jpg")
+        print("  python digiscan_trocr.py --video 0  # webcam")
