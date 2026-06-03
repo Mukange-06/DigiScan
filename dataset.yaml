@@ -1,0 +1,5 @@
+names:
+- licence
+nc: 1
+train: C:\Users\mukan\OneDrive\Desktop\Digiscan\train.txt
+val: C:\Users\mukan\OneDrive\Desktop\Digiscan\val.txt
