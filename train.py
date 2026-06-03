@@ -1,6 +1,6 @@
 from model import get_model
 
-EPOCHS = 20
+EPOCHS = 100
 BATCH_SIZE = 8
 IMG_SIZE = 640  # pixels — YOLO resizes all images to this during training
 
